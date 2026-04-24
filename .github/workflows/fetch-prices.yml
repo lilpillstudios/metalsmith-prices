@@ -1,0 +1,95 @@
+name: Fetch metal prices
+
+on:
+  schedule:
+    # 3×/day at 06:00, 14:00, 22:00 UTC (≈ 2am, 10am, 6pm US Eastern)
+    - cron: '0 6,14,22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Notify healthchecks (start)
+        if: always()
+        env:
+          HC_URL: ${{ secrets.HEALTHCHECKS_URL }}
+        run: |
+          if [ -n "$HC_URL" ]; then
+            curl -fsS -m 10 --retry 3 "$HC_URL/start" || true
+          fi
+
+      - name: Fetch spot prices from stooq
+        id: fetch
+        run: |
+          set -euo pipefail
+          GOLD_CSV=$(curl -fsSL "https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv")
+          SILVER_CSV=$(curl -fsSL "https://stooq.com/q/l/?s=xagusd&f=sd2t2ohlcv&h&e=csv")
+          # CSV header: Symbol,Date,Time,Open,High,Low,Close,Volume — we want Close (column 7)
+          GOLD=$(echo "$GOLD_CSV" | tail -n 1 | cut -d',' -f7)
+          SILVER=$(echo "$SILVER_CSV" | tail -n 1 | cut -d',' -f7)
+          echo "gold=$GOLD" >> "$GITHUB_OUTPUT"
+          echo "silver=$SILVER" >> "$GITHUB_OUTPUT"
+          echo "Fetched gold=$GOLD silver=$SILVER"
+
+      - name: Sanity check bounds
+        env:
+          GOLD: ${{ steps.fetch.outputs.gold }}
+          SILVER: ${{ steps.fetch.outputs.silver }}
+        run: |
+          if ! awk "BEGIN {exit !($GOLD > 500 && $GOLD < 20000)}"; then
+            echo "::error::🚨 METALSMITH PRICE FETCH FAILED — Gold price $GOLD outside plausible bounds [500, 20000]. App is serving fallback prices until fixed."
+            exit 1
+          fi
+          if ! awk "BEGIN {exit !($SILVER > 5 && $SILVER < 500)}"; then
+            echo "::error::🚨 METALSMITH PRICE FETCH FAILED — Silver price $SILVER outside plausible bounds [5, 500]. App is serving fallback prices until fixed."
+            exit 1
+          fi
+
+      - name: Write prices.json
+        run: |
+          cat > prices.json <<EOF
+          {
+            "gold": ${{ steps.fetch.outputs.gold }},
+            "silver": ${{ steps.fetch.outputs.silver }},
+            "lastUpdated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "source": "stooq"
+          }
+          EOF
+          cat prices.json
+
+      - name: Commit and push
+        run: |
+          git config user.name "metalsmith-prices-bot"
+          git config user.email "actions@github.com"
+          git add prices.json
+          if git diff --cached --quiet; then
+            echo "No price change — skipping commit"
+          else
+            git commit -m "Update prices: gold=${{ steps.fetch.outputs.gold }} silver=${{ steps.fetch.outputs.silver }}"
+            git push
+          fi
+
+      - name: Notify healthchecks (success)
+        if: success()
+        env:
+          HC_URL: ${{ secrets.HEALTHCHECKS_URL }}
+        run: |
+          if [ -n "$HC_URL" ]; then
+            curl -fsS -m 10 --retry 3 "$HC_URL" || true
+          fi
+
+      - name: Notify healthchecks (failure)
+        if: failure()
+        env:
+          HC_URL: ${{ secrets.HEALTHCHECKS_URL }}
+        run: |
+          if [ -n "$HC_URL" ]; then
+            curl -fsS -m 10 --retry 3 "$HC_URL/fail" || true
+          fi
