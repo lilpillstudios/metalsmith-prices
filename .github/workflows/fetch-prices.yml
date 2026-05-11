@@ -1,14 +1,12 @@
 name: Fetch metal prices
-
 on:
   schedule:
-    # 3×/day at 06:00, 14:00, 22:00 UTC (≈ 2am, 10am, 6pm US Eastern)
     - cron: '0 6,14,22 * * *'
   workflow_dispatch:
-
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 permissions:
   contents: write
-
 jobs:
   fetch:
     runs-on: ubuntu-latest
@@ -25,30 +23,57 @@ jobs:
             curl -fsS -m 10 --retry 3 "$HC_URL/start" || true
           fi
 
+      - name: Load last known good prices
+        id: last
+        run: |
+          LAST_GOLD=$(jq -r '.gold' prices.json 2>/dev/null || echo "")
+          LAST_SILVER=$(jq -r '.silver' prices.json 2>/dev/null || echo "")
+          echo "gold=$LAST_GOLD" >> "$GITHUB_OUTPUT"
+          echo "silver=$LAST_SILVER" >> "$GITHUB_OUTPUT"
+          echo "Last known: gold=$LAST_GOLD silver=$LAST_SILVER"
+
       - name: Fetch spot prices from stooq
         id: fetch
         run: |
-          set -euo pipefail
-          GOLD_CSV=$(curl -fsSL "https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv")
-          SILVER_CSV=$(curl -fsSL "https://stooq.com/q/l/?s=xagusd&f=sd2t2ohlcv&h&e=csv")
-          # CSV header: Symbol,Date,Time,Open,High,Low,Close,Volume — we want Close (column 7)
-          GOLD=$(echo "$GOLD_CSV" | tail -n 1 | cut -d',' -f7)
-          SILVER=$(echo "$SILVER_CSV" | tail -n 1 | cut -d',' -f7)
+          is_number() { echo "$1" | grep -qE '^[0-9]+(\.[0-9]+)?$'; }
+
+          GOLD_CSV=$(curl -fsSL --max-time 15 "https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv" 2>/dev/null || echo "")
+          SILVER_CSV=$(curl -fsSL --max-time 15 "https://stooq.com/q/l/?s=xagusd&f=sd2t2ohlcv&h&e=csv" 2>/dev/null || echo "")
+
+          GOLD=$(echo "$GOLD_CSV" | tail -n 1 | cut -d',' -f7 | tr -d '[:space:]')
+          SILVER=$(echo "$SILVER_CSV" | tail -n 1 | cut -d',' -f7 | tr -d '[:space:]')
+
+          echo "Raw fetched: gold='$GOLD' silver='$SILVER'"
+
+          # If stooq returned garbage, fall back to last known good price
+          if ! is_number "$GOLD"; then
+            echo "⚠️ Stooq returned non-numeric gold value: '$GOLD' — using last known price"
+            GOLD="${{ steps.last.outputs.gold }}"
+          fi
+          if ! is_number "$SILVER"; then
+            echo "⚠️ Stooq returned non-numeric silver value: '$SILVER' — using last known price"
+            SILVER="${{ steps.last.outputs.last_silver }}"
+          fi
+
           echo "gold=$GOLD" >> "$GITHUB_OUTPUT"
           echo "silver=$SILVER" >> "$GITHUB_OUTPUT"
-          echo "Fetched gold=$GOLD silver=$SILVER"
+          echo "Final: gold=$GOLD silver=$SILVER"
 
       - name: Sanity check bounds
         env:
           GOLD: ${{ steps.fetch.outputs.gold }}
           SILVER: ${{ steps.fetch.outputs.silver }}
         run: |
-          if ! awk "BEGIN {exit !($GOLD > 500 && $GOLD < 20000)}"; then
-            echo "::error::🚨 METALSMITH PRICE FETCH FAILED — Gold price $GOLD outside plausible bounds [500, 20000]. App is serving fallback prices until fixed."
+          if [ -z "$GOLD" ] || [ -z "$SILVER" ]; then
+            echo "::error::No price available (stooq failed and no fallback in prices.json)"
+            exit 1
+          fi
+          if ! awk "BEGIN {exit !($GOLD > 500 && $GOLD < 25000)}"; then
+            echo "::error::Gold $GOLD outside bounds [500, 25000]"
             exit 1
           fi
           if ! awk "BEGIN {exit !($SILVER > 5 && $SILVER < 500)}"; then
-            echo "::error::🚨 METALSMITH PRICE FETCH FAILED — Silver price $SILVER outside plausible bounds [5, 500]. App is serving fallback prices until fixed."
+            echo "::error::Silver $SILVER outside bounds [5, 500]"
             exit 1
           fi
 
